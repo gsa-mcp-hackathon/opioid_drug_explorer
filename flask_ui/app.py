@@ -1,0 +1,384 @@
+import asyncio
+import json
+import os
+import traceback
+import time
+from threading import Lock
+from datetime import timedelta
+from flask import Flask, render_template, request, jsonify, send_from_directory, Response, abort, redirect, url_for
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+
+# from databricks.sdk import WorkspaceClient
+# from databricks_mcp import DatabricksOAuthClientProvider
+app = Flask(__name__)
+
+port = os.environ.get("DATABRICKS_APP_PORT", "8000")
+
+MCP_URL = os.getenv("MCP_URL", "http://127.0.0.1:8000/mcp")
+
+print("Flask MCP URL:", MCP_URL, flush=True)
+
+async def fetch_drug(drug_name):
+    async with streamable_http_client(MCP_URL) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+
+            result = await session.call_tool("get_drug_label", {"drug_name": drug_name})
+
+            if result.is_error:
+                raise RuntimeError(str(result.content))
+
+            # Your MCP server returns TextContent
+            if result.structured_content is not None:
+                data = result.structured_content
+            else:
+                text_blocks = [
+                    block.text for block in result.content if block.type == "text"
+                ]
+
+                if not text_blocks:
+                    raise ValueError("MCP returned no text response")
+
+                data = json.loads(text_blocks[0])
+
+            if not isinstance(data, dict):
+                raise ValueError("Expected a JSON object from MCP")
+
+            return data
+
+
+async def search_fda_evidence(query, source, top_k=3):
+    """Call an FDA RAG retrieval tool through MCP."""
+
+    tool_names = {
+        "pdf": "search_opioid_label_updates",
+        "web": "search_opioid_medications",
+    }
+
+    tool_name = tool_names.get(source)
+
+    if not tool_name:
+        raise ValueError("Invalid FDA source selected.")
+
+    async with streamable_http_client(MCP_URL) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+
+            result = await session.call_tool(
+                tool_name, {"query": query, "top_k": top_k}
+            )
+
+            if result.is_error:
+                raise RuntimeError(str(result.content))
+
+            if result.structured_content is not None:
+                data = result.structured_content
+            else:
+                text_blocks = [
+                    block.text for block in result.content if block.type == "text"
+                ]
+
+                if not text_blocks:
+                    raise ValueError("MCP returned no text response.")
+
+                data = json.loads(text_blocks[0])
+
+            if not isinstance(data, dict):
+                raise ValueError("Unexpected MCP response format.")
+
+            if not data.get("success", False):
+                raise RuntimeError(data.get("error", "FDA retrieval failed."))
+
+            return data
+
+async def fetch_cyp_history(drug_name, enzymes):
+    async with streamable_http_client(MCP_URL) as (
+        read_stream,
+        write_stream,
+    ):
+        async with ClientSession(
+            read_stream, write_stream
+        ) as session:
+
+            await session.initialize()
+
+            result = await session.call_tool(
+                "get_drug_cyp_label_history",
+                {
+                    "drug_name": drug_name,
+                    "cyp_targets": enzymes,
+                },
+            )
+
+            if result.is_error:
+                raise RuntimeError(str(result.content))
+
+            if result.structured_content is not None:
+                data = result.structured_content
+            else:
+                blocks = [
+                    block.text
+                    for block in result.content
+                    if block.type == "text"
+                ]
+                data = json.loads(blocks[0]) if blocks else {}
+
+            if not isinstance(data, dict):
+                raise ValueError("Unexpected MCP response")
+
+            return data
+_latest_cache = {"expires": 0, "labels": []}
+_latest_lock = Lock()
+
+FOUR_DRUGS = ("Oxycodone", "Hydrocodone", "Tramadol", "Buprenorphine")
+
+
+def normalize_latest_labels(data):
+    """Accept both plain and FastMCP wrapped structured results."""
+    for _ in range(3):
+        if isinstance(data, dict) and isinstance(data.get("labels"), list):
+            break
+        if isinstance(data, dict) and isinstance(data.get("result"), dict):
+            data = data["result"]
+        elif isinstance(data, dict) and isinstance(data.get("structuredContent"), dict):
+            data = data["structuredContent"]
+        else:
+            break
+    labels = data.get("labels", []) if isinstance(data, dict) else []
+    by_drug = {str(r.get("drug_name", "")).casefold(): r for r in labels if isinstance(r, dict)}
+    return [by_drug.get(name.casefold(), {
+        "drug_name": name, "error": "No record returned by MCP server"
+    }) for name in FOUR_DRUGS]
+
+
+async def fetch_latest_labels():
+    async with streamable_http_client(
+        MCP_URL
+    ) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+            result = await session.call_tool(
+                "get_latest_four_opioid_labels", {},
+                read_timeout_seconds=210,
+            )
+            if result.is_error:
+                raise RuntimeError(str(result.content))
+            data = result.structured_content
+            if data is None:
+                blocks = [b.text for b in result.content if b.type == "text"]
+                data = json.loads(blocks[0]) if blocks else {}
+            return normalize_latest_labels(data)
+
+
+def cached_latest_labels():
+    with _latest_lock:
+        if time.monotonic() >= _latest_cache["expires"]:
+            try:
+                _latest_cache["labels"] = asyncio.run(fetch_latest_labels())
+                _latest_cache["expires"] = time.monotonic() + 900
+            except Exception as exc:
+                app.logger.exception("Latest four labels retrieval failed")
+                _latest_cache["labels"] = [
+                    {"drug_name": name, "error": f"Retrieval failed: {type(exc).__name__}: {exc}"}
+                    for name in FOUR_DRUGS
+                ]
+                _latest_cache["expires"] = time.monotonic() + 60
+        return _latest_cache["labels"]
+
+@app.get("/")
+def home():
+    return redirect(url_for("drug_page"))
+
+@app.route("/drug", methods=["GET", "POST"], endpoint="drug_page")
+@app.route("/cyp", methods=["GET", "POST"], endpoint="cyp_page")
+@app.route("/rag", methods=["GET", "POST"], endpoint="rag_page")
+def module_page():
+    page = request.path.strip("/")
+    drug_data = None
+    rag_data = None
+    error = None
+    cyp_data = None
+    cyp_drug = "Oxycodone"
+    cyp_enzymes = "CYP2D6, CYP3A4"
+    drug_name = ""
+    query = ""
+    source = "pdf"
+
+    if request.method == "POST":
+        search_type = request.form.get("search_type", page)
+        if search_type != page:
+            abort(400)
+
+        if search_type == "drug":
+            drug_name = request.form.get("drug_name", "").strip()
+
+            if not drug_name:
+                error = "Please enter a drug name."
+            else:
+                try:
+                    drug_data = asyncio.run(fetch_drug(drug_name))
+
+                    if not drug_data.get("success", False):
+                        error = drug_data.get("error", "Drug information unavailable.")
+                        drug_data = None
+
+                except Exception:
+                    traceback.print_exc()
+                    error = "Unable to retrieve drug information."
+
+        elif search_type == "rag":
+            query = request.form.get("query", "").strip()
+            source = request.form.get("source", "pdf")
+
+            if not query:
+                error = "Please enter a question."
+            else:
+                try:
+                    rag_data = asyncio.run(
+                        search_fda_evidence(query=query, source=source, top_k=3)
+                    )
+
+                except Exception:
+                    traceback.print_exc()
+                    error = "Unable to retrieve FDA evidence."
+        elif search_type == "cyp":
+
+            cyp_drug = request.form.get(
+                "cyp_drug", ""
+            ).strip()
+
+            cyp_enzymes = request.form.get(
+                "cyp_enzymes", "CYP2D6, CYP3A4"
+            ).strip()
+
+            enzymes = [
+                e.strip()
+                for e in cyp_enzymes.split(",")
+                if e.strip()
+            ]
+
+            if not cyp_drug or not enzymes:
+                error = "Enter a drug name and CYP enzymes."
+
+            else:
+                try:
+                    cyp_data = asyncio.run(
+                        fetch_cyp_history(cyp_drug, enzymes)
+                    )
+
+                    if not cyp_data.get("success"):
+                        error = cyp_data.get(
+                            "error", "Unable to retrieve CYP history."
+                        )
+                        cyp_data = None
+
+                except Exception:
+                    traceback.print_exc()
+                    error = "CYP history retrieval failed."
+    return render_template(
+        f"{page}.html",
+        active_page=page,
+        drug_data=drug_data,
+        rag_data=rag_data,
+        drug_name=drug_name,
+        query=query,
+        source=source,
+        error=error,
+        cyp_data=cyp_data,
+        cyp_drug=cyp_drug,
+        cyp_enzymes=cyp_enzymes,
+        latest_labels=cached_latest_labels() if page == "cyp" else [],
+    )
+
+async def fetch_cyp_details(record_id, enzymes):
+    async with streamable_http_client(MCP_URL) as (
+        read_stream,
+        write_stream,
+    ):
+        async with ClientSession(
+            read_stream,
+            write_stream,
+        ) as session:
+            await session.initialize()
+
+            result = await session.call_tool(
+                "get_drug_cyp_label_details",
+                {
+                    "record_id": record_id,
+                    "cyp_targets": enzymes,
+                },
+            )
+
+            if result.is_error:
+                raise RuntimeError(str(result.content))
+
+            data = result.structured_content
+
+            if data is None:
+                blocks = [
+                    block.text
+                    for block in result.content
+                    if block.type == "text"
+                ]
+
+                if not blocks:
+                    raise ValueError("Empty MCP response.")
+
+                data = json.loads(blocks[0])
+
+            if isinstance(data, dict) and "result" in data:
+                data = data["result"]
+
+            return data
+
+
+@app.post("/api/cyp-label-details")
+def cyp_label_details_api():
+    payload = request.get_json(silent=True) or {}
+
+    record_id = payload.get("record_id", "")
+    enzymes = payload.get("enzymes", [])
+
+    if not isinstance(enzymes, list):
+        return jsonify({"error": "Invalid enzyme list."}), 400
+
+    try:
+        result = asyncio.run(
+            fetch_cyp_details(record_id, enzymes)
+        )
+    except Exception:
+        app.logger.exception("CYP details retrieval failed")
+        return jsonify({
+            "error": "Unable to retrieve CYP label details."
+        }), 502
+
+    return jsonify(result), (200 if result.get("success") else 400)
+
+
+
+
+@app.get("/api/pdf-table-preview/<int:page>/<int:table_number>")
+def pdf_table_preview(page, table_number):
+    """Render a table locally; never send image bytes through MCP."""
+    from pathlib import Path
+    import pymupdf as fitz
+
+    # Set FDA_RAG_PDF_PATH to the same PDF used by the MCP RAG tool.
+    pdf_path = Path(os.getenv("FDA_RAG_PDF_PATH", "data/opioid_label_updates.pdf"))
+    if not pdf_path.is_file() or page < 1 or table_number < 1:
+        abort(404)
+    with fitz.open(str(pdf_path)) as doc:
+        if page > len(doc):
+            abort(404)
+        pdf_page = doc[page - 1]
+        tables = pdf_page.find_tables().tables
+        if table_number > len(tables):
+            abort(404)
+        bbox = fitz.Rect(tables[table_number - 1].bbox)
+        pix = pdf_page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), clip=bbox, alpha=False)
+        return Response(pix.tobytes("jpeg", jpg_quality=65), mimetype="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=3600"})
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5000, debug=True)
