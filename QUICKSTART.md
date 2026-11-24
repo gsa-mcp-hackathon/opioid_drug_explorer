@@ -1,4 +1,4 @@
-# Drug Labeling MCP Server – GSA Flask & Databricks Complete Guide
+# Drug Labeling MCP Server – GSA Flask & Databricks Quick start Guide
 
 ## Resources
 
