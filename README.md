@@ -3,6 +3,8 @@
 A drug-labeling research assistant built with **Model Context Protocol (MCP)**, **FastMCP**, **Flask**, and **Databricks**. The project provides structured access to public drug-labeling sources and FDA PDF reference materials, with an emphasis on opioid safety information, CYP-mediated interactions, and evidence-grounded responses.
 
 > **Hackathon 2026 project:** A prototype for exploring FDA drug-labeling information. It is not a clinical decision-support system and should not be used as a substitute for official prescribing information or medical advice.
+> 
+> The project is deployed as databricks app and can be found at `https://opioid-drugs-mcp-server-7474654188777746.aws.databricksapps.com/`
 
 ## Features
 
@@ -54,7 +56,7 @@ User / AI Assistant / Flask UI
 
 ## MCP Tools
 
-### 1. `get_drug_label`
+### 1. Drug label retrieval -- `get_drug_label`
 
 Accepts a drug name and retrieves available labeling information. Brand/generic normalization and DailyMed fallback are supported by the project's retrieval layer.
 
@@ -66,7 +68,7 @@ Example input:
 
 The returned information depends on the source record and may include warnings, adverse reactions, interactions, and labeling metadata.
 
-### 2. CYP label details : Drug interaction, Enzyme Metabolism 
+### 2. CYP label details : Drug interaction, Enzyme Metabolism -- `get_drug_cyp_label_details`, `get_latest_four_opioid_labels`
 
 Presents labeling information for four selected drugs:
 
@@ -75,9 +77,9 @@ Presents labeling information for four selected drugs:
 - Tramadol
 - Buprenorphine
 
-The interface displays the selected label's effective date, an LLM-generated summary where available, and a details view focused on **CYP2D6** and **CYP3A4** metabolism and drug-interaction evidence. This module is intended for examining label evidence, not predicting patient-specific interactions.
+The interface displays the selected label's effective date, an LLM-generated summary where available, and a details view focused on **CYP2D6** and **CYP3A4** metabolism and drug-interaction evidences from four different sections i.e., clnical pharmacology, pharmacokinetics, drug interactions and boxed warnings. This module is intended for examining label evidence, not predicting patient-specific interactions.
 
-### 3. FDA PDF search / RAG
+### 3. FDA PDF search / RAG --`search_opioid_label_updates`
 
 Searches an indexed collection of FDA PDF documents, retrieves relevant passages or tables, and uses the retrieved material to support an answer. Retrieval quality depends on document extraction, indexing, query wording, and evidence coverage.
 
@@ -171,6 +173,8 @@ The exact `app.yaml` configuration and deployment commands depend on the current
 ## Evaluation
 
 The evaluation workflow compares  **MCP-assisted responses** against **baseline LLM responses** and **baseline LLM responses based on provided evidences** on a curated set of drug-labeling questions. The project has used a evaluation dataset with questions from 4 categories, reference answers, scope adherence and associated evidences.
+As the baseline mode was having issues accessing openFDA api endpoint, we provided the relevant evidences, such as, api responses for some drugs and the pdf file under `eval/phoenix/evidence` folder and prompted LLM models to use these evidences in baseline with evidence evaluation mode while baseline was not given any local resources to generate answers.
+Both the test dataset (i.e., `golden_fda_eval_with_evidence.csv`)and  the results (i.e., `opioid_drug_explorer_evaluation_results.csv`) are saved in `eval/phoenix` folder for reference. New execution of `run_experiment.py` would save the results inside a folder named `results`.
 
 ### Evaluation dimensions
 
